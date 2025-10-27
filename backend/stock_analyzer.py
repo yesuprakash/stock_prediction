@@ -2,7 +2,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import json
-from db import get_connection
+from backend.db import get_connection
 from datetime import datetime, timedelta
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
@@ -19,7 +19,17 @@ NEWSAPI_KEY = "31a4ab26b3ca4edb9edd5b5e5bc272ef"
 # -------------------------------
 # 1️⃣ Stock List (NSE Tickers)
 # -------------------------------
-stocks = ["ABB.NS", "ACC.NS", "TATACONSUM.NS"]
+stocks = ["JINDALSTEL.NS","SAIL.NS","TATASTEEL.NS","HINDALCO.NS","TATAPOWER.NS","JKLAKSHMI.NS",
+"AMBUJACEM.NS","RAMCOIND.NS","JSWSTEEL.NS","TATAMOTORS.NS","ASHOKLEY.NS","M&M.NS",
+"HEROMOTOCO.NS","APOLLOTYRE.NS","BHEL.NS","EICHERMOT.NS","INFY.NS",
+"LTTS.NS","SIEMENS.NS","LT.NS","LTIM.NS","WIPRO.NS","TCS.NS","IFBIND.NS","TITAN.NS",
+"AUROPHARMA.NS","SUNPHARMA.NS","GLENMARK.NS","BIOCON.NS","LUPIN.NS","UPL.NS",
+"SOBHA.NS","CIPLA.NS","IDEA.NS","RELIANCE.NS","PETRONET.NS","NTPC.NS","ONGC.NS",
+"BEML.NS","ADANIGREEN.NS","ADANIPORTS.NS","BHARTIARTL.NS","ABB.NS","GODREJCP.NS",
+"TATACONSUM.NS","RBA.NS","JUBLFOOD.NS","RADICO.NS","VENKEYS.NS","GRASIM.NS",
+"POWERGRID.NS","SBIN.NS","AXISBANK.NS","HDFCBANK.NS","INDUSINDBK.NS","LICHSGFIN.NS",
+"ASIANPAINT.NS"
+]
 
 # -------------------------------
 # 2️⃣ Excel Columns
@@ -71,6 +81,66 @@ def insert_prediction(row):
         conn.commit()
     except Exception as e:
         print(f"❌ DB Insert Error for {row['Stock Name']}: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+def analyze_and_save_to_summary(df):
+    """Analyze generated predictions and save enhanced summary to DB"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # Calculate rank score with a richer formula
+        # (Adjust weights if needed later)
+        df['Rank Score'] = (
+            df['Probability of Trade Success (%)'] * 0.4 +
+            df['Technical Strength Score (%)'] * 0.3 +
+            df['Risk/Reward Ratio'] * 15 +  # amplify R/R contribution
+            df['Bollinger % Position'].apply(lambda x: (100 - abs(50 - x)) * 0.05)  # closer to mid band gets slight boost
+        )
+
+        # Sort by Rank Score
+        top_rows = df.sort_values(by='Rank Score', ascending=False)
+
+        for _, row in top_rows.iterrows():
+            cursor.execute("""
+                INSERT INTO prediction_summary
+                (stock_symbol, trade_signal, sector_outlook, probability_success,
+                 technical_score, rank_score, target_price, stop_loss, entry_price, 
+                 risk_reward, sentiment, trend, bollinger_position, bollinger_percent,
+                 rsi, macd_trend, volatility_level, chart_pattern, volume_spike,
+                 liquidity, catalyst_events, support_level, resistance_level)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                row["Stock Name"],
+                row["Trade Signal"],
+                row["Sector / Industry Outlook"],
+                float(row["Probability of Trade Success (%)"]) if pd.notna(row["Probability of Trade Success (%)"]) else None,
+                float(row["Technical Strength Score (%)"]) if pd.notna(row["Technical Strength Score (%)"]) else None,
+                float(row["Rank Score"]) if pd.notna(row["Rank Score"]) else None,
+                float(row["Target Price"]) if pd.notna(row["Target Price"]) else None,
+                float(row["Stop-Loss Price"]) if pd.notna(row["Stop-Loss Price"]) else None,
+                float(row["Suggested Entry Price Range"]) if pd.notna(row["Suggested Entry Price Range"]) else None,
+                float(row["Risk/Reward Ratio"]) if pd.notna(row["Risk/Reward Ratio"]) else None,
+                row["Market Sentiment / Analyst Notes"],
+                row["Trend"],
+                row["Bollinger Band Position"],
+                float(row["Bollinger % Position"]) if pd.notna(row["Bollinger % Position"]) else None,
+                float(row["RSI"]) if pd.notna(row["RSI"]) else None,
+                row["MACD Trend"],
+                row["Volatility Level"],
+                row["Chart Pattern Observed"],
+                row["Recent Volume Spikes"],
+                row["Liquidity"],
+                row["Catalyst Events"],
+                float(row["Key Support Levels"]) if pd.notna(row["Key Support Levels"]) else None,
+                float(row["Key Resistance Levels"]) if pd.notna(row["Key Resistance Levels"]) else None
+            ))
+
+        conn.commit()
+        print(f"📊 {len(top_rows)} summarized predictions saved to prediction_summary.")
+    except Exception as e:
+        print(f"❌ Summary insert error: {e}")
     finally:
         cursor.close()
         conn.close()
@@ -336,3 +406,7 @@ for row in range(2, ws.max_row+1):
 
 wb.save(output_file)
 print(f"✅ Fully formatted dashboard Excel saved to {output_file}")
+
+analyze_and_save_to_summary(df)
+print("✅ Prediction summary saved to DB successfully.")
+
