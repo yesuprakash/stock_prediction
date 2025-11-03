@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import json
+import traceback
 from backend.db import get_connection
 from datetime import datetime, timedelta
 from ta.momentum import RSIIndicator
@@ -19,17 +20,28 @@ NEWSAPI_KEY = "31a4ab26b3ca4edb9edd5b5e5bc272ef"
 # -------------------------------
 # 1️⃣ Stock List (NSE Tickers)
 # -------------------------------
-stocks = ["JINDALSTEL.NS","SAIL.NS","TATASTEEL.NS","HINDALCO.NS","TATAPOWER.NS","JKLAKSHMI.NS",
-"AMBUJACEM.NS","RAMCOIND.NS","JSWSTEEL.NS","TATAMOTORS.NS","ASHOKLEY.NS","M&M.NS",
-"HEROMOTOCO.NS","APOLLOTYRE.NS","BHEL.NS","EICHERMOT.NS","INFY.NS",
-"LTTS.NS","SIEMENS.NS","LT.NS","LTIM.NS","WIPRO.NS","TCS.NS","IFBIND.NS","TITAN.NS",
-"AUROPHARMA.NS","SUNPHARMA.NS","GLENMARK.NS","BIOCON.NS","LUPIN.NS","UPL.NS",
-"SOBHA.NS","CIPLA.NS","IDEA.NS","RELIANCE.NS","PETRONET.NS","NTPC.NS","ONGC.NS",
-"BEML.NS","ADANIGREEN.NS","ADANIPORTS.NS","BHARTIARTL.NS","ABB.NS","GODREJCP.NS",
-"TATACONSUM.NS","RBA.NS","JUBLFOOD.NS","RADICO.NS","VENKEYS.NS","GRASIM.NS",
-"POWERGRID.NS","SBIN.NS","AXISBANK.NS","HDFCBANK.NS","INDUSINDBK.NS","LICHSGFIN.NS",
-"ASIANPAINT.NS"
+stocks = [
+  "SHRIRAMFIN.NS","M&M.NS","SBIN.NS","APOLLOHOSP.NS","INDIGO.NS","ONGC.NS","GRASIM.NS","SUNPHARMA.NS","RELIANCE.NS",
+  "HDFCBANK.NS","COALINDIA.NS","EICHERMOT.NS","TMPV.NS","SBILIFE.NS","POWERGRID.NS","AXISBANK.NS","CIPLA.NS",
+  "KOTAKBANK.NS","HINDALCO.NS","JIOFIN.NS","BHARTIARTL.NS","BAJAJFINSV.NS","TATACONSUM.NS","BAJFINANCE.NS",
+  "ICICIBANK.NS","ETERNAL.NS","LT.NS","HDFCLIFE.NS","ADANIENT.NS","WIPRO.NS","TRENT.NS","NTPC.NS","ULTRACEMCO.NS",
+  "BAJAJ-AUTO.NS","HCLTECH.NS","DRREDDY.NS","TATASTEEL.NS","TECHM.NS","INFY.NS","ASIANPAINT.NS","HINDUNILVR.NS",
+  "ITC.NS","JSWSTEEL.NS","NESTLEIND.NS","ADANIPORTS.NS","MAXHEALTH.NS","TCS.NS","BEL.NS","TITAN.NS","MARUTI.NS",
+  "SONACOMS.NS","EXIDEIND.NS","TVSMOTOR.NS","BHARATFORG.NS","HEROMOTOCO.NS","TIINDIA.NS","MOTHERSON.NS","ASHOKLEY.NS",
+  "UNOMINDA.NS","BOSCHLTD.NS","COFORGE.NS","LTIM.NS","MPHASIS.NS","OFSS.NS","PERSISTENT.NS","VEDL.NS","NATIONALUM.NS",
+  "SAIL.NS","LLOYDSME.NS","JSL.NS","JINDALSTEL.NS","NMDC.NS","APLAPOLLO.NS","HINDCOPPER.NS","HINDZINC.NS","WELCORP.NS",
+  "WOCKPHARMA.NS","GLAND.NS","IPCALAB.NS","LAURUSLABS.NS","PPLPHARMA.NS","DIVISLAB.NS","JBCHEPHARM.NS","BIOCON.NS",
+  "AUROPHARMA.NS","TORNTPHARM.NS","GLENMARK.NS","ALKEM.NS","AJANTPHARM.NS","ABBOTINDIA.NS","ZYDUSLIFE.NS","LUPIN.NS",
+  "MANKIND.NS","BANDHANBNK.NS","YESBANK.NS","INDUSINDBK.NS","FEDERALBNK.NS","IDFCFIRSTB.NS","RBLBANK.NS","PHOENIXLTD.NS",
+  "DLF.NS","LODHA.NS","PRESTIGE.NS","SIGNATURE.NS","OBEROIRLTY.NS","BRIGADE.NS","SOBHA.NS","GODREJPROP.NS","ANANTRAJ.NS",
+  "VGUARD.NS","PGEL.NS","CENTURYPLY.NS","BATAINDIA.NS","CROMPTON.NS","KALYANKJIL.NS","AMBER.NS","BLUESTARCO.NS",
+  "HAVELLS.NS","DIXON.NS","CERA.NS","VOLTAS.NS","WHIRLPOOL.NS","KAJARIACER.NS","AEGISLOG.NS","BPCL.NS","HINDPETRO.NS",
+  "IOC.NS","PETRONET.NS","GUJGASLTD.NS","IGL.NS","OIL.NS","CASTROLIND.NS","GSPL.NS","GAIL.NS","ATGL.NS","MGL.NS",
+  "TATAPOWER.NS","JKLAKSHMI.NS","AMBUJACEM.NS","RAMCOIND.NS","TATAMOTORS.NS","APOLLOTYRE.NS","BHEL.NS","LTTS.NS",
+  "SIEMENS.NS","IFBIND.NS","UPL.NS","IDEA.NS","BEML.NS","ADANIGREEN.NS","ABB.NS","GODREJCP.NS","RBA.NS","JUBLFOOD.NS",
+  "RADICO.NS","VENKEYS.NS","LICHSGFIN.NS"
 ]
+
 
 # -------------------------------
 # 2️⃣ Excel Columns
@@ -53,6 +65,13 @@ columns = [
 
 df = pd.DataFrame(columns=columns)
 
+def safe_run(func, default=None):
+    """Safely execute a function and return a default if it fails."""
+    try:
+        return func()
+    except Exception:
+        return default
+    
 def insert_prediction(row):
     conn = get_connection()
     cursor = conn.cursor()
@@ -61,8 +80,8 @@ def insert_prediction(row):
             INSERT INTO predictions
             (prediction_date, stock_symbol, trade_signal, probability_success, 
              technical_strength, risk_reward, entry_price, target_price, 
-             stop_loss, sector_outlook, sentiment, trend, raw_data)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             stop_loss, sector_outlook, sentiment, trend, analyzed_price, raw_data)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             row["Date"],
             row["Stock Name"],
@@ -76,6 +95,7 @@ def insert_prediction(row):
             row["Sector / Industry Outlook"],
             row["Market Sentiment / Analyst Notes"],
             row["Trend"],
+            float(row["Current Price"]) if "Current Price" in row else None,
             json.dumps(row.to_dict())  # store the full row as JSON for future flexibility
         ))
         conn.commit()
@@ -109,8 +129,8 @@ def analyze_and_save_to_summary(df):
                  technical_score, rank_score, target_price, stop_loss, entry_price, 
                  risk_reward, sentiment, trend, bollinger_position, bollinger_percent,
                  rsi, macd_trend, volatility_level, chart_pattern, volume_spike,
-                 liquidity, catalyst_events, support_level, resistance_level)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 liquidity, catalyst_events, support_level, resistance_level, analyzed_price)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 row["Stock Name"],
                 row["Trade Signal"],
@@ -134,7 +154,8 @@ def analyze_and_save_to_summary(df):
                 row["Liquidity"],
                 row["Catalyst Events"],
                 float(row["Key Support Levels"]) if pd.notna(row["Key Support Levels"]) else None,
-                float(row["Key Resistance Levels"]) if pd.notna(row["Key Resistance Levels"]) else None
+                float(row["Key Resistance Levels"]) if pd.notna(row["Key Resistance Levels"]) else None,
+                float(row["Current Price"]) if pd.notna(row["Current Price"]) else None 
             ))
 
         conn.commit()
@@ -260,101 +281,121 @@ def analyze_sentiment(headlines):
         return "Neutral"
 
 # -------------------------------
-# 5️⃣ Process Each Stock
+# 5️⃣ Process Each Stock (Safe Version)
 # -------------------------------
+skipped_stocks = []
+
 for stock in stocks:
-    ticker = yf.Ticker(stock)
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=60)
-    data = ticker.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
-    if data.empty:
-        print(f"No data for {stock}")
+    try:
+        ticker = yf.Ticker(stock)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=60)
+        data = ticker.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+
+        # ✅ Skip if not enough data (avoid ATR/RSI errors)
+        if data.empty or len(data) < 20:
+            print(f"⚠️ Skipping {stock}: insufficient data ({len(data)} rows)")
+            skipped_stocks.append(stock)
+            continue
+
+        # ✅ Safe technical calculations
+        current_price = safe_run(lambda: data['Close'].iloc[-1])
+        recent_high = safe_run(lambda: data['High'].max())
+        recent_low = safe_run(lambda: data['Low'].min())
+
+        ma5 = safe_run(lambda: data['Close'].rolling(5).mean().iloc[-1])
+        ma10 = safe_run(lambda: data['Close'].rolling(10).mean().iloc[-1])
+        ma20 = safe_run(lambda: data['Close'].rolling(20).mean().iloc[-1])
+
+        rsi = safe_run(lambda: calculate_rsi(data))
+        macd_trend = safe_run(lambda: calculate_macd_trend(data), "N/A")
+        bb_position, bb_percent = safe_run(lambda: calculate_bollinger_position(data), ("N/A", 50))
+        atr = safe_run(lambda: calculate_atr(data))
+        chart_pattern = safe_run(lambda: identify_chart_pattern(data))
+        vol_spike = safe_run(lambda: volume_spike(data))
+        liquidity = safe_run(lambda: liquidity_level(data))
+
+        # ✅ Probability, signal, and scoring
+        prob_breakout = safe_run(lambda: probability_breakout(rsi, macd_trend, bb_position))
+        signal = safe_run(lambda: trade_signal(macd_trend, rsi, bb_percent), "Neutral")
+
+        # ✅ Sector and sentiment
+        sector = safe_run(lambda: get_sector_trend_dynamic(stock), "Unknown")
+        earnings_str = safe_run(lambda: get_upcoming_earnings(stock), "N/A")
+        headlines = safe_run(lambda: get_recent_news(stock.split(".")[0]), [])
+        sentiment = safe_run(lambda: analyze_sentiment(headlines), "Neutral")
+        catalyst_events = "; ".join(headlines) if headlines else "No recent events"
+
+        # ✅ Technical score calculation
+        tech_score = 0
+        if macd_trend == "Bullish": tech_score += 3
+        if 30 < (rsi or 0) < 70: tech_score += 2
+        if bb_position == "Within Bands": tech_score += 1
+        if vol_spike == "Spike": tech_score += 2
+        if liquidity == "High": tech_score += 2
+        if sentiment == "Positive": tech_score += 1
+        tech_score_percent = round((tech_score / 11) * 100, 2)
+
+        # ✅ Price levels
+        support = recent_low
+        resistance = recent_high
+        entry_price = support + (resistance - support) * 0.2
+        target_price = resistance
+        stop_loss = support * 0.98
+        risk_reward = safe_run(lambda: round((target_price - entry_price) / (entry_price - stop_loss), 2), 0)
+
+        # ✅ Build DataFrame row
+        new_row = pd.DataFrame([{
+            "Stock Name": stock,
+            "Date": end_date.strftime("%Y-%m-%d"),
+            "Current Price": round(current_price, 2) if current_price else None,
+            "Sector / Industry Outlook": sector,
+            "Trend": macd_trend,
+            "Recent High/Low": f"{recent_high}/{recent_low}",
+            "Current Price vs Moving Averages": f"{current_price} vs MA5:{ma5:.2f}, MA10:{ma10:.2f}, MA20:{ma20:.2f}",
+            "RSI": rsi,
+            "MACD Trend": macd_trend,
+            "Average Daily Volume": data['Volume'].mean(),
+            "Recent Volume Spikes": vol_spike,
+            "Liquidity": liquidity,
+            "ATR": atr,
+            "Expected Price Range": f"{recent_low} - {recent_high}",
+            "Volatility Level": "High" if atr > (recent_high-recent_low)/2 else "Moderate",
+            "Key Support Levels": support,
+            "Key Resistance Levels": resistance,
+            "Probability of Trade Success (%)": prob_breakout,
+            "Moving Averages": f"MA5:{ma5:.2f}, MA10:{ma10:.2f}, MA20:{ma20:.2f}",
+            "RSI Value": rsi,
+            "MACD Signal": macd_trend,
+            "Bollinger Band Position": bb_position,
+            "Bollinger % Position": bb_percent,
+            "Chart Pattern Observed": chart_pattern,
+            "Trade Signal": signal,
+            "Upcoming Earnings/Dividends/Corporate Actions": earnings_str,
+            "Catalyst Events": catalyst_events,
+            "Market Sentiment / Analyst Notes": sentiment,
+            "Best-case Price Target": round(target_price, 2),
+            "Likely Price Range": f"{entry_price} - {target_price}",
+            "Worst-case / Stop-Loss Risk": round(stop_loss, 2),
+            "Risk/Reward Ratio": risk_reward,
+            "Technical Strength Score (%)": tech_score_percent,
+            "Suggested Entry Price Range": round(entry_price, 2),
+            "Stop-Loss Price": round(stop_loss, 2),
+            "Target Price": round(target_price, 2),
+            "Expected Holding Duration": "1-3 weeks",
+            "Additional Notes": ""
+        }])
+
+        df = pd.concat([df, new_row], ignore_index=True)
+
+        # ✅ DB insert (same as before)
+        insert_prediction(new_row.iloc[0])
+
+    except Exception as e:
+        print(f"❌ Error analyzing {stock}: {e}")
+        traceback.print_exc()
+        skipped_stocks.append(stock)
         continue
-
-    current_price = data['Close'].iloc[-1]
-    recent_high = data['High'].max()
-    recent_low = data['Low'].min()
-    
-    ma5 = data['Close'].rolling(5).mean().iloc[-1]
-    ma10 = data['Close'].rolling(10).mean().iloc[-1]
-    ma20 = data['Close'].rolling(20).mean().iloc[-1]
-    
-    rsi = calculate_rsi(data)
-    macd_trend = calculate_macd_trend(data)
-    bb_position, bb_percent = calculate_bollinger_position(data)
-    atr = calculate_atr(data)
-    chart_pattern = identify_chart_pattern(data)
-    vol_spike = volume_spike(data)
-    liquidity = liquidity_level(data)
-    
-    prob_breakout = probability_breakout(rsi, macd_trend, bb_position)
-    signal = trade_signal(macd_trend, rsi, bb_percent)
-
-    sector = get_sector_trend_dynamic(stock)
-    earnings_str = get_upcoming_earnings(stock)
-    headlines = get_recent_news(stock.split(".")[0])
-    sentiment = analyze_sentiment(headlines)
-    catalyst_events = "; ".join(headlines) if headlines else "No recent events"
-
-    tech_score = 0
-    if macd_trend == "Bullish": tech_score += 3
-    if 30 < rsi < 70: tech_score += 2
-    if bb_position == "Within Bands": tech_score += 1
-    if vol_spike == "Spike": tech_score += 2
-    if liquidity == "High": tech_score += 2
-    if sentiment == "Positive": tech_score +=1
-    tech_score_percent = round((tech_score / 11) * 100, 2)
-
-    support = recent_low
-    resistance = recent_high
-    entry_price = support + (resistance - support) * 0.2
-    target_price = resistance
-    stop_loss = support * 0.98
-    risk_reward = round((target_price - entry_price) / (entry_price - stop_loss), 2)
-
-    new_row = pd.DataFrame([{
-        "Stock Name": stock,
-        "Date": end_date.strftime("%Y-%m-%d"),
-        "Sector / Industry Outlook": sector,
-        "Trend": macd_trend,
-        "Recent High/Low": f"{recent_high}/{recent_low}",
-        "Current Price vs Moving Averages": f"{current_price} vs MA5:{ma5:.2f}, MA10:{ma10:.2f}, MA20:{ma20:.2f}",
-        "RSI": rsi,
-        "MACD Trend": macd_trend,
-        "Average Daily Volume": data['Volume'].mean(),
-        "Recent Volume Spikes": vol_spike,
-        "Liquidity": liquidity,
-        "ATR": atr,
-        "Expected Price Range": f"{recent_low} - {recent_high}",
-        "Volatility Level": "High" if atr > (recent_high-recent_low)/2 else "Moderate",
-        "Key Support Levels": support,
-        "Key Resistance Levels": resistance,
-        "Probability of Trade Success (%)": prob_breakout,
-        "Moving Averages": f"MA5:{ma5:.2f}, MA10:{ma10:.2f}, MA20:{ma20:.2f}",
-        "RSI Value": rsi,
-        "MACD Signal": macd_trend,
-        "Bollinger Band Position": bb_position,
-        "Bollinger % Position": bb_percent,
-        "Chart Pattern Observed": chart_pattern,
-        "Trade Signal": signal,
-        "Upcoming Earnings/Dividends/Corporate Actions": earnings_str,
-        "Catalyst Events": catalyst_events,
-        "Market Sentiment / Analyst Notes": sentiment,
-        "Best-case Price Target": round(target_price,2),
-        "Likely Price Range": f"{entry_price} - {target_price}",
-        "Worst-case / Stop-Loss Risk": round(stop_loss,2),
-        "Risk/Reward Ratio": risk_reward,
-        "Technical Strength Score (%)": tech_score_percent,
-        "Suggested Entry Price Range": round(entry_price,2),
-        "Stop-Loss Price": round(stop_loss,2),
-        "Target Price": round(target_price,2),
-        "Expected Holding Duration": "1-3 weeks",
-        "Additional Notes": ""
-    }])
-
-    df = pd.concat([df, new_row], ignore_index=True)
-
-    insert_prediction(new_row.iloc[0])
     
 # -------------------------------
 # 6️⃣ Save to Excel
@@ -410,3 +451,8 @@ print(f"✅ Fully formatted dashboard Excel saved to {output_file}")
 analyze_and_save_to_summary(df)
 print("✅ Prediction summary saved to DB successfully.")
 
+
+if skipped_stocks:
+    with open("skipped_stocks.log", "a") as log:
+        log.write(f"{datetime.now()} - Skipped: {', '.join(skipped_stocks)}\n")
+    print(f"⚠️ Skipped {len(skipped_stocks)} stocks. Logged in skipped_stocks.log.")

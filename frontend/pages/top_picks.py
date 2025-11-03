@@ -20,7 +20,7 @@ signal_filter = st.selectbox("Trade Signal", ["All", "Strong Buy", "Neutral", "S
 query = f"""
     SELECT stock_symbol, trade_signal, rank_score,
            probability_success, technical_score, risk_reward,
-           target_price, stop_loss, analysis_date
+           analyzed_price, target_price, stop_loss,  analysis_date
     FROM prediction_summary
     WHERE analysis_date >= CURRENT_DATE - INTERVAL '{days} days'
 """
