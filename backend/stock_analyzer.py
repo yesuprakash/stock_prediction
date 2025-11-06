@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import json
 import traceback
+import numpy as np
 from backend.db import get_connection
 from datetime import datetime, timedelta
 from ta.momentum import RSIIndicator
@@ -49,7 +50,8 @@ stocks = [
 # MACD stands for Moving Average Convergence Divergence, a technical analysis tool used to identify trends and momentum in the stock market. It is calculated by subtracting a 26-period Exponential Moving Average (EMA) from a 12-period EMA, and is typically used alongside a 9-period EMA of the MACD line (the signal line) to generate buy and sell signals.
 # -------------------------------
 columns = [
-    "Stock Name", "Date", "Sector / Industry Outlook", "Trend", "Recent High/Low",
+    "Stock Name", "Date", "Prediction Term", "Forecast Horizon (Days)", "Days of Data Used",
+    "Sector / Industry Outlook", "Trend", "Recent High/Low",
     "Current Price vs Moving Averages", "RSI", "MACD Trend",
     "Average Daily Volume", "Recent Volume Spikes", "Liquidity",
     "ATR", "Expected Price Range", "Volatility Level",
@@ -72,6 +74,7 @@ def safe_run(func, default=None):
     except Exception:
         return default
     
+# ✅ UPDATED DB INSERT
 def insert_prediction(row):
     conn = get_connection()
     cursor = conn.cursor()
@@ -80,8 +83,9 @@ def insert_prediction(row):
             INSERT INTO predictions
             (prediction_date, stock_symbol, trade_signal, probability_success, 
              technical_strength, risk_reward, entry_price, target_price, 
-             stop_loss, sector_outlook, sentiment, trend, analyzed_price, raw_data)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             stop_loss, sector_outlook, sentiment, trend, analyzed_price, raw_data,
+             prediction_term, forecast_horizon, days_of_data)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             row["Date"],
             row["Stock Name"],
@@ -96,7 +100,10 @@ def insert_prediction(row):
             row["Market Sentiment / Analyst Notes"],
             row["Trend"],
             float(row["Current Price"]) if "Current Price" in row else None,
-            json.dumps(row.to_dict())  # store the full row as JSON for future flexibility
+            json.dumps(row.to_dict()),
+            row["Prediction Term"],
+            to_python(row["Forecast Horizon (Days)"]),
+            to_python(row["Days of Data Used"])
         ))
         conn.commit()
     except Exception as e:
@@ -105,21 +112,18 @@ def insert_prediction(row):
         cursor.close()
         conn.close()
 
+# ✅ UPDATED SUMMARY SAVE
 def analyze_and_save_to_summary(df):
-    """Analyze generated predictions and save enhanced summary to DB"""
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # Calculate rank score with a richer formula
-        # (Adjust weights if needed later)
         df['Rank Score'] = (
             df['Probability of Trade Success (%)'] * 0.4 +
             df['Technical Strength Score (%)'] * 0.3 +
-            df['Risk/Reward Ratio'] * 15 +  # amplify R/R contribution
-            df['Bollinger % Position'].apply(lambda x: (100 - abs(50 - x)) * 0.05)  # closer to mid band gets slight boost
+            df['Risk/Reward Ratio'] * 15 +
+            df['Bollinger % Position'].apply(lambda x: (100 - abs(50 - x)) * 0.05)
         )
 
-        # Sort by Rank Score
         top_rows = df.sort_values(by='Rank Score', ascending=False)
 
         for _, row in top_rows.iterrows():
@@ -129,12 +133,11 @@ def analyze_and_save_to_summary(df):
                  technical_score, rank_score, target_price, stop_loss, entry_price, 
                  risk_reward, sentiment, trend, bollinger_position, bollinger_percent,
                  rsi, macd_trend, volatility_level, chart_pattern, volume_spike,
-                 liquidity, catalyst_events, support_level, resistance_level, analyzed_price)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 liquidity, catalyst_events, support_level, resistance_level, analyzed_price,
+                 prediction_term, forecast_horizon, days_of_data)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
-                row["Stock Name"],
-                row["Trade Signal"],
-                row["Sector / Industry Outlook"],
+                row["Stock Name"], row["Trade Signal"], row["Sector / Industry Outlook"],
                 float(row["Probability of Trade Success (%)"]) if pd.notna(row["Probability of Trade Success (%)"]) else None,
                 float(row["Technical Strength Score (%)"]) if pd.notna(row["Technical Strength Score (%)"]) else None,
                 float(row["Rank Score"]) if pd.notna(row["Rank Score"]) else None,
@@ -142,20 +145,16 @@ def analyze_and_save_to_summary(df):
                 float(row["Stop-Loss Price"]) if pd.notna(row["Stop-Loss Price"]) else None,
                 float(row["Suggested Entry Price Range"]) if pd.notna(row["Suggested Entry Price Range"]) else None,
                 float(row["Risk/Reward Ratio"]) if pd.notna(row["Risk/Reward Ratio"]) else None,
-                row["Market Sentiment / Analyst Notes"],
-                row["Trend"],
+                row["Market Sentiment / Analyst Notes"], row["Trend"],
                 row["Bollinger Band Position"],
                 float(row["Bollinger % Position"]) if pd.notna(row["Bollinger % Position"]) else None,
                 float(row["RSI"]) if pd.notna(row["RSI"]) else None,
-                row["MACD Trend"],
-                row["Volatility Level"],
-                row["Chart Pattern Observed"],
-                row["Recent Volume Spikes"],
-                row["Liquidity"],
-                row["Catalyst Events"],
+                row["MACD Trend"], row["Volatility Level"], row["Chart Pattern Observed"],
+                row["Recent Volume Spikes"], row["Liquidity"], row["Catalyst Events"],
                 float(row["Key Support Levels"]) if pd.notna(row["Key Support Levels"]) else None,
                 float(row["Key Resistance Levels"]) if pd.notna(row["Key Resistance Levels"]) else None,
-                float(row["Current Price"]) if pd.notna(row["Current Price"]) else None 
+                float(row["Current Price"]) if pd.notna(row["Current Price"]) else None,
+                row["Prediction Term"], to_python(row["Forecast Horizon (Days)"]), to_python(row["Days of Data Used"])
             ))
 
         conn.commit()
@@ -265,6 +264,14 @@ def get_recent_news(company_name):
             return headlines
     return []
 
+def to_python(v):
+    """Convert numpy types to native python types"""
+    if isinstance(v, (np.int64, np.int32, np.int16, np.int8)):
+        return int(v)
+    if isinstance(v, (np.float64, np.float32, np.float16)):
+        return float(v)
+    return v
+
 def analyze_sentiment(headlines):
     positive = ["gain", "rise", "bullish", "up", "growth", "profit"]
     negative = ["fall", "drop", "bearish", "loss", "decline", "weak"]
@@ -297,6 +304,11 @@ for stock in stocks:
             print(f"⚠️ Skipping {stock}: insufficient data ({len(data)} rows)")
             skipped_stocks.append(stock)
             continue
+
+        # ✅ New prediction term logic
+        forecast_days = 15
+        days_used = len(data)
+        prediction_term = "Short-Term (1-3 weeks)"
 
         # ✅ Safe technical calculations
         current_price = safe_run(lambda: data['Close'].iloc[-1])
@@ -348,6 +360,9 @@ for stock in stocks:
         new_row = pd.DataFrame([{
             "Stock Name": stock,
             "Date": end_date.strftime("%Y-%m-%d"),
+             "Prediction Term": prediction_term,
+            "Forecast Horizon (Days)": forecast_days,
+            "Days of Data Used": days_used,
             "Current Price": round(current_price, 2) if current_price else None,
             "Sector / Industry Outlook": sector,
             "Trend": macd_trend,
