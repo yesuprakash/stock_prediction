@@ -1,3 +1,14 @@
+#!/usr/bin/env python3
+"""
+Patched stock analysis script (Excel output removed).
+- Uses environment variable NEWSAPI_KEY (if present) — do NOT hardcode API keys.
+- Batch downloads price data via yfinance.download for speed/reliability; has fallback per-ticker.
+- Safer numeric handling, safer DB inserts, improved logging.
+- Excel generation & formatting removed (DB only).
+"""
+
+import os
+import logging
 import yfinance as yf
 import pandas as pd
 import requests
@@ -9,14 +20,33 @@ from datetime import datetime, timedelta
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands, AverageTrueRange
-import openpyxl
-from openpyxl.styles import PatternFill
-from openpyxl.formatting.rule import ColorScaleRule
+import time
+from typing import Tuple, Optional
 
 # -------------------------------
-# 0️⃣ API Keys
+# Logging config
 # -------------------------------
-NEWSAPI_KEY = "31a4ab26b3ca4edb9edd5b5e5bc272ef"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# -------------------------------
+# 0️⃣ API Keys / Config
+# -------------------------------
+NEWSAPI_KEY = "31a4ab26b3ca4edb9edd5b5e5bc272ef" # os.getenv("NEWSAPI_KEY")   Set this in OS env if you want news
+if not NEWSAPI_KEY:
+    logger.warning("NEWSAPI_KEY not set. get_recent_news() will return no results.")
+
+# Configurable thresholds & windows
+BOLLINGER_WINDOW = 20
+BOLLINGER_DEV = 2
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 # -------------------------------
 # 1️⃣ Stock List (NSE Tickers)
@@ -43,11 +73,8 @@ stocks = [
   "RADICO.NS","VENKEYS.NS","LICHSGFIN.NS","ACC.NS"
 ]
 
-
 # -------------------------------
-# 2️⃣ Excel Columns
-# RSI: Relative Strength Index, is a momentum-based technical indicator that measures the speed and change of a stock's price movements to help identify whether it is overbought or oversold.
-# MACD stands for Moving Average Convergence Divergence, a technical analysis tool used to identify trends and momentum in the stock market. It is calculated by subtracting a 26-period Exponential Moving Average (EMA) from a 12-period EMA, and is typically used alongside a 9-period EMA of the MACD line (the signal line) to generate buy and sell signals.
+# 2️⃣ Excel Columns (kept as before for column ordering if you still want them later)
 # -------------------------------
 columns = [
     "Stock Name", "Date", "Prediction Term", "Forecast Horizon (Days)", "Days of Data Used",
@@ -67,18 +94,50 @@ columns = [
 
 df = pd.DataFrame(columns=columns)
 
-def safe_run(func, default=None):
-    """Safely execute a function and return a default if it fails."""
+# -------------------------------
+# Utility helpers & safe_run
+# -------------------------------
+def safe_run(func, default=None, log_exceptions=True, name=None):
+    """Safely execute a function. If it fails, log and return default."""
     try:
         return func()
-    except Exception:
+    except Exception as e:
+        if log_exceptions:
+            logger.debug(f"safe_run failed in {name or func}: {e}", exc_info=True)
         return default
-    
-# ✅ UPDATED DB INSERT
-def insert_prediction(row):
-    conn = get_connection()
-    cursor = conn.cursor()
+
+def to_python(v):
+    """Convert numpy types to native python types"""
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    return v
+
+def fmt_ma(val):
+    """Format moving average safely"""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return "N/A"
     try:
+        return f"{val:.2f}"
+    except Exception:
+        return str(val)
+
+# -------------------------------
+# 3️⃣ Database insert (safer)
+# -------------------------------
+def insert_prediction(row: pd.Series):
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        # Safely extract numeric values
+        def safe_float(x):
+            return float(x) if pd.notna(x) else None
+
+        raw_json = json.dumps(row.to_dict(), default=str)
+
         cursor.execute("""
             INSERT INTO predictions
             (prediction_date, stock_symbol, trade_signal, probability_success, 
@@ -87,46 +146,65 @@ def insert_prediction(row):
              prediction_term, forecast_horizon, days_of_data)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            row["Date"],
-            row["Stock Name"],
-            row["Trade Signal"],
-            float(row["Probability of Trade Success (%)"]) if row["Probability of Trade Success (%)"] else None,
-            float(row["Technical Strength Score (%)"]) if row["Technical Strength Score (%)"] else None,
-            float(row["Risk/Reward Ratio"]) if row["Risk/Reward Ratio"] else None,
-            float(row["Suggested Entry Price Range"]) if row["Suggested Entry Price Range"] else None,
-            float(row["Target Price"]) if row["Target Price"] else None,
-            float(row["Stop-Loss Price"]) if row["Stop-Loss Price"] else None,
-            row["Sector / Industry Outlook"],
-            row["Market Sentiment / Analyst Notes"],
-            row["Trend"],
-            float(row["Current Price"]) if "Current Price" in row else None,
-            json.dumps(row.to_dict()),
-            row["Prediction Term"],
-            to_python(row["Forecast Horizon (Days)"]),
-            to_python(row["Days of Data Used"])
+            row.get("Date"),
+            row.get("Stock Name"),
+            row.get("Trade Signal"),
+            safe_float(row.get("Probability of Trade Success (%)")),
+            safe_float(row.get("Technical Strength Score (%)")),
+            safe_float(row.get("Risk/Reward Ratio")),
+            safe_float(row.get("Suggested Entry Price Range")),
+            safe_float(row.get("Target Price")),
+            safe_float(row.get("Stop-Loss Price")),
+            row.get("Sector / Industry Outlook"),
+            row.get("Market Sentiment / Analyst Notes"),
+            row.get("Trend"),
+            safe_float(row.get("Current Price")) if "Current Price" in row else None,
+            raw_json,
+            row.get("Prediction Term"),
+            to_python(row.get("Forecast Horizon (Days)")),
+            to_python(row.get("Days of Data Used"))
         ))
         conn.commit()
+        logger.debug(f"Inserted prediction for {row.get('Stock Name')}")
     except Exception as e:
-        print(f"❌ DB Insert Error for {row['Stock Name']}: {e}")
+        logger.exception(f"DB Insert Error for {row.get('Stock Name') if row is not None else 'UNKNOWN'}: {e}")
     finally:
-        cursor.close()
-        conn.close()
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
-# ✅ UPDATED SUMMARY SAVE
-def analyze_and_save_to_summary(df):
-    conn = get_connection()
-    cursor = conn.cursor()
+# -------------------------------
+# 4️⃣ Summary save (safer)
+# -------------------------------
+def analyze_and_save_to_summary(df: pd.DataFrame):
+    conn = None
+    cursor = None
     try:
+        # Ensure numeric columns
+        numeric_cols = ["Probability of Trade Success (%)", "Technical Strength Score (%)",
+                        "Risk/Reward Ratio", "Bollinger % Position", "RSI"]
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        # Rank Score with safe fill
         df['Rank Score'] = (
-            df['Probability of Trade Success (%)'] * 0.4 +
-            df['Technical Strength Score (%)'] * 0.3 +
-            df['Risk/Reward Ratio'] * 15 +
-            df['Bollinger % Position'].apply(lambda x: (100 - abs(50 - x)) * 0.05)
+            df['Probability of Trade Success (%)'].fillna(0) * 0.4 +
+            df['Technical Strength Score (%)'].fillna(0) * 0.3 +
+            df['Risk/Reward Ratio'].fillna(0) * 15 +
+            df['Bollinger % Position'].apply(lambda x: (100 - abs(50 - x)) * 0.05 if pd.notna(x) else 0)
         )
 
         top_rows = df.sort_values(by='Rank Score', ascending=False)
 
+        conn = get_connection()
+        cursor = conn.cursor()
+        inserted = 0
         for _, row in top_rows.iterrows():
+            def sf(col):
+                return float(row[col]) if (col in row and pd.notna(row[col])) else None
+
             cursor.execute("""
                 INSERT INTO prediction_summary
                 (stock_symbol, trade_signal, sector_outlook, probability_success,
@@ -137,108 +215,159 @@ def analyze_and_save_to_summary(df):
                  prediction_term, forecast_horizon, days_of_data)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
-                row["Stock Name"], row["Trade Signal"], row["Sector / Industry Outlook"],
-                float(row["Probability of Trade Success (%)"]) if pd.notna(row["Probability of Trade Success (%)"]) else None,
-                float(row["Technical Strength Score (%)"]) if pd.notna(row["Technical Strength Score (%)"]) else None,
-                float(row["Rank Score"]) if pd.notna(row["Rank Score"]) else None,
-                float(row["Target Price"]) if pd.notna(row["Target Price"]) else None,
-                float(row["Stop-Loss Price"]) if pd.notna(row["Stop-Loss Price"]) else None,
-                float(row["Suggested Entry Price Range"]) if pd.notna(row["Suggested Entry Price Range"]) else None,
-                float(row["Risk/Reward Ratio"]) if pd.notna(row["Risk/Reward Ratio"]) else None,
-                row["Market Sentiment / Analyst Notes"], row["Trend"],
-                row["Bollinger Band Position"],
-                float(row["Bollinger % Position"]) if pd.notna(row["Bollinger % Position"]) else None,
-                float(row["RSI"]) if pd.notna(row["RSI"]) else None,
-                row["MACD Trend"], row["Volatility Level"], row["Chart Pattern Observed"],
-                row["Recent Volume Spikes"], row["Liquidity"], row["Catalyst Events"],
-                float(row["Key Support Levels"]) if pd.notna(row["Key Support Levels"]) else None,
-                float(row["Key Resistance Levels"]) if pd.notna(row["Key Resistance Levels"]) else None,
-                float(row["Current Price"]) if pd.notna(row["Current Price"]) else None,
-                row["Prediction Term"], to_python(row["Forecast Horizon (Days)"]), to_python(row["Days of Data Used"])
+                row.get("Stock Name"), row.get("Trade Signal"), row.get("Sector / Industry Outlook"),
+                sf("Probability of Trade Success (%)"),
+                sf("Technical Strength Score (%)"),
+                float(row.get("Rank Score")) if pd.notna(row.get("Rank Score")) else None,
+                sf("Target Price"),
+                sf("Stop-Loss Price"),
+                sf("Suggested Entry Price Range"),
+                sf("Risk/Reward Ratio"),
+                row.get("Market Sentiment / Analyst Notes"), row.get("Trend"),
+                row.get("Bollinger Band Position"),
+                float(row.get("Bollinger % Position")) if pd.notna(row.get("Bollinger % Position")) else None,
+                sf("RSI"),
+                row.get("MACD Trend"), row.get("Volatility Level"), row.get("Chart Pattern Observed"),
+                row.get("Recent Volume Spikes"), row.get("Liquidity"), row.get("Catalyst Events"),
+                sf("Key Support Levels"), sf("Key Resistance Levels"), sf("Current Price"),
+                row.get("Prediction Term"), to_python(row.get("Forecast Horizon (Days)")), to_python(row.get("Days of Data Used"))
             ))
+            inserted += 1
 
         conn.commit()
-        print(f"📊 {len(top_rows)} summarized predictions saved to prediction_summary.")
+        logger.info(f"📊 {inserted} summarized predictions saved to prediction_summary.")
     except Exception as e:
-        print(f"❌ Summary insert error: {e}")
+        logger.exception(f"❌ Summary insert error: {e}")
     finally:
-        cursor.close()
-        conn.close()
-
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 # -------------------------------
-# 3️⃣ Helper Functions (Technical)
+# 5️⃣ Technical helper functions (safe)
 # -------------------------------
-def calculate_rsi(data, period=14):
-    rsi = RSIIndicator(data['Close'], window=period).rsi()
-    return rsi.iloc[-1]
+def calculate_rsi(data: pd.DataFrame, period: int = RSI_PERIOD) -> Optional[float]:
+    try:
+        rsi = RSIIndicator(data['Close'], window=period).rsi()
+        return rsi.iloc[-1]
+    except Exception as e:
+        logger.debug(f"RSI calc failed: {e}", exc_info=True)
+        return None
 
-def calculate_macd_trend(data):
-    macd = MACD(data['Close']).macd()
-    signal = MACD(data['Close']).macd_signal()
-    return "Bullish" if macd.iloc[-1] > signal.iloc[-1] else "Bearish"
+def calculate_macd_trend(data: pd.DataFrame) -> str:
+    try:
+        macd_calc = MACD(data['Close'])
+        macd_line = macd_calc.macd()
+        signal_line = macd_calc.macd_signal()
+        if pd.isna(macd_line.iloc[-1]) or pd.isna(signal_line.iloc[-1]):
+            return "N/A"
+        return "Bullish" if macd_line.iloc[-1] > signal_line.iloc[-1] else "Bearish"
+    except Exception as e:
+        logger.debug(f"MACD calc failed: {e}", exc_info=True)
+        return "N/A"
 
-def calculate_bollinger_position(data):
-    bb = BollingerBands(data['Close'], window=20, window_dev=2)
-    current = data['Close'].iloc[-1]
-    lower = bb.bollinger_lband().iloc[-1]
-    upper = bb.bollinger_hband().iloc[-1]
-    if current > upper:
-        return "Above Upper Band", 100
-    elif current < lower:
-        return "Below Lower Band", 0
-    else:
-        perc = (current - lower) / (upper - lower) * 100
-        return "Within Bands", round(perc, 2)
+def calculate_bollinger_position(data: pd.DataFrame) -> Tuple[str, float]:
+    try:
+        bb = BollingerBands(data['Close'], window=BOLLINGER_WINDOW, window_dev=BOLLINGER_DEV)
+        current = data['Close'].iloc[-1]
+        lower = bb.bollinger_lband().iloc[-1]
+        upper = bb.bollinger_hband().iloc[-1]
+        if pd.isna(lower) or pd.isna(upper) or pd.isna(current):
+            return "Unknown", 50.0
+        if current > upper:
+            return "Above Upper Band", 100.0
+        elif current < lower:
+            return "Below Lower Band", 0.0
+        else:
+            denom = (upper - lower)
+            if denom == 0:
+                perc = 50.0
+            else:
+                perc = (current - lower) / denom * 100.0
+            return "Within Bands", round(perc, 2)
+    except Exception as e:
+        logger.debug(f"Bollinger calc failed: {e}", exc_info=True)
+        return "Unknown", 50.0
 
-def calculate_atr(data):
-    atr = AverageTrueRange(data['High'], data['Low'], data['Close'], window=14).average_true_range()
-    return atr.iloc[-1]
+def calculate_atr(data: pd.DataFrame, window: int = ATR_PERIOD) -> Optional[float]:
+    try:
+        atr = AverageTrueRange(data['High'], data['Low'], data['Close'], window=window).average_true_range()
+        return atr.iloc[-1]
+    except Exception as e:
+        logger.debug(f"ATR calc failed: {e}", exc_info=True)
+        return None
 
-def identify_chart_pattern(data):
-    highs = data['High'].tail(20)
-    lows = data['Low'].tail(20)
-    if highs.max() == data['High'].iloc[-1]:
-        return "Potential Uptrend / Breakout"
-    elif lows.min() == data['Low'].iloc[-1]:
-        return "Potential Downtrend / Breakdown"
-    else:
-        return "Sideways / Consolidation"
+def identify_chart_pattern(data: pd.DataFrame) -> str:
+    try:
+        highs = data['High'].tail(20)
+        lows = data['Low'].tail(20)
+        if highs.max() == data['High'].iloc[-1]:
+            return "Potential Uptrend / Breakout"
+        elif lows.min() == data['Low'].iloc[-1]:
+            return "Potential Downtrend / Breakdown"
+        else:
+            return "Sideways / Consolidation"
+    except Exception as e:
+        logger.debug(f"Chart pattern detection failed: {e}", exc_info=True)
+        return "Unknown"
 
-def volume_spike(data):
-    avg_vol = data['Volume'].rolling(10).mean().iloc[-1]
-    recent = data['Volume'].iloc[-1]
-    return "Spike" if recent > 1.5 * avg_vol else "Normal"
+def volume_spike(data: pd.DataFrame) -> str:
+    try:
+        avg_vol = data['Volume'].rolling(10).mean().iloc[-1]
+        recent = data['Volume'].iloc[-1]
+        if pd.isna(avg_vol) or pd.isna(recent):
+            return "Unknown"
+        return "Spike" if recent > 1.5 * avg_vol else "Normal"
+    except Exception as e:
+        logger.debug(f"Volume spike calc failed: {e}", exc_info=True)
+        return "Unknown"
 
-def liquidity_level(data):
-    avg_vol = data['Volume'].rolling(10).mean().iloc[-1]
-    if avg_vol > 500000:
-        return "High"
-    elif avg_vol > 100000:
-        return "Medium"
-    else:
-        return "Low"
+def liquidity_level(data: pd.DataFrame) -> str:
+    try:
+        avg_vol = data['Volume'].rolling(10).mean().iloc[-1]
+        if pd.isna(avg_vol):
+            return "Unknown"
+        if avg_vol > 500000:
+            return "High"
+        elif avg_vol > 100000:
+            return "Medium"
+        else:
+            return "Low"
+    except Exception as e:
+        logger.debug(f"Liquidity calc failed: {e}", exc_info=True)
+        return "Unknown"
 
-def probability_breakout(rsi, macd_trend, bb_pos):
-    score = 50
-    if rsi < 70 and macd_trend == "Bullish" and "Upper" not in bb_pos:
-        score += 20
-    elif rsi > 70 or macd_trend == "Bearish":
-        score -= 20
-    return max(min(score, 100), 0)
+def probability_breakout(rsi: Optional[float], macd_trend: str, bb_pos: str) -> float:
+    try:
+        score = 50
+        if rsi is None:
+            return float(score)
+        if rsi < 70 and macd_trend == "Bullish" and "Upper" not in bb_pos:
+            score += 20
+        elif rsi > 70 or macd_trend == "Bearish":
+            score -= 20
+        return float(max(min(score, 100), 0))
+    except Exception as e:
+        logger.debug(f"probability_breakout failed: {e}", exc_info=True)
+        return 50.0
 
-def trade_signal(macd_trend, rsi, bb_perc):
-    if macd_trend == "Bullish" and rsi < 70 and bb_perc < 80:
-        return "Strong Buy"
-    elif macd_trend == "Bearish" and rsi > 30 and bb_perc > 20:
-        return "Strong Sell"
-    else:
+def trade_signal(macd_trend: str, rsi: Optional[float], bb_perc: float) -> str:
+    try:
+        if macd_trend == "Bullish" and (rsi is not None and rsi < 70) and (bb_perc is not None and bb_perc < 80):
+            return "Strong Buy"
+        elif macd_trend == "Bearish" and (rsi is not None and rsi > 30) and (bb_perc is not None and bb_perc > 20):
+            return "Strong Sell"
+        else:
+            return "Neutral"
+    except Exception as e:
+        logger.debug(f"trade_signal failed: {e}", exc_info=True)
         return "Neutral"
 
 # -------------------------------
-# 4️⃣ Helper Functions (Indian Sector / News)
+# 6️⃣ Sector / News helpers (safer)
 # -------------------------------
-def get_sector_trend_dynamic(stock_symbol):
+def get_sector_trend_dynamic(stock_symbol: str) -> str:
     sector_index_map = {
         "GAIL.NS": "CNXENERGY",
         "TATASTEEL.NS": "CNXMETAL",
@@ -249,28 +378,26 @@ def get_sector_trend_dynamic(stock_symbol):
         return "Unknown"
     return f"{sector_index.replace('CNX','')} sector trend; short-term outlook based on recent momentum"
 
-def get_upcoming_earnings(stock_symbol):
+def get_upcoming_earnings(stock_symbol: str) -> str:
     return "No upcoming earnings"
 
-def get_recent_news(company_name):
-    today = datetime.now()
-    from_date = (today - timedelta(days=14)).strftime('%Y-%m-%d')
-    url = f"https://newsapi.org/v2/everything?q={company_name}+India&from={from_date}&sortBy=publishedAt&language=en&apiKey={NEWSAPI_KEY}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        articles = response.json().get("articles", [])
-        if articles:
-            headlines = [a["title"] for a in articles[:5]]
-            return headlines
-    return []
-
-def to_python(v):
-    """Convert numpy types to native python types"""
-    if isinstance(v, (np.int64, np.int32, np.int16, np.int8)):
-        return int(v)
-    if isinstance(v, (np.float64, np.float32, np.float16)):
-        return float(v)
-    return v
+def get_recent_news(company_name: str):
+    """Return list of top 5 headlines or [] if not available.
+       Uses NEWSAPI_KEY env var. Quotes query safely."""
+    if not NEWSAPI_KEY:
+        return []
+    try:
+        today = datetime.now()
+        from_date = (today - timedelta(days=14)).strftime('%Y-%m-%d')
+        q = requests.utils.quote(f"{company_name} India")
+        url = f"https://newsapi.org/v2/everything?q={q}&from={from_date}&sortBy=publishedAt&language=en&apiKey={NEWSAPI_KEY}"
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        articles = resp.json().get("articles", [])
+        return [a["title"] for a in articles[:5] if a.get("title")]
+    except Exception as e:
+        logger.debug(f"News fetch failed for {company_name}: {e}")
+        return []
 
 def analyze_sentiment(headlines):
     positive = ["gain", "rise", "bullish", "up", "growth", "profit"]
@@ -288,98 +415,165 @@ def analyze_sentiment(headlines):
         return "Neutral"
 
 # -------------------------------
-# 5️⃣ Process Each Stock (Safe Version)
+# 7️⃣ Price data: batch download helper
+# -------------------------------
+def batch_download_price_data(tickers, start, end, threads=True):
+    """Attempt batch download. Returns the raw result from yfinance.download"""
+    try:
+        logger.info(f"Batch downloading {len(tickers)} tickers from {start.date()} to {end.date()}")
+        data = yf.download(
+            tickers,
+            start=start.strftime('%Y-%m-%d'),
+            end=end.strftime('%Y-%m-%d'),
+            group_by='ticker',
+            threads=threads,
+            auto_adjust=False,
+            progress=False
+        )
+        return data
+    except Exception as e:
+        logger.warning(f"Batch download failed: {e}. Will fallback to per-ticker downloads.")
+        return None
+
+def get_ticker_data_from_batch(batch_data, ticker):
+    """Extract per-ticker DataFrame from yf.download output.
+       Handles both 'group_by=ticker' multi-column and single-dataframe cases."""
+    try:
+        if batch_data is None or batch_data.empty:
+            return None
+        # If download returned multi-level columns (group_by='ticker'):
+        if isinstance(batch_data.columns, pd.MultiIndex):
+            # Some tickers may be missing; handle KeyError
+            if ticker in batch_data.columns.levels[0]:
+                df = batch_data[ticker].dropna(how='all')
+                # Ensure columns standard names exist
+                if set(['Open','High','Low','Close','Volume']).issubset(df.columns):
+                    return df
+                else:
+                    # try fallback by reindex
+                    return df
+            else:
+                return None
+        else:
+            # Single dataframe for all tickers (unlikely when multiple tickers passed),
+            # caller should then fallback to per-ticker Ticker history.
+            return None
+    except Exception as e:
+        logger.debug(f"get_ticker_data_from_batch failed for {ticker}: {e}", exc_info=True)
+        return None
+
+# -------------------------------
+# 8️⃣ Main processing loop (safe)
 # -------------------------------
 skipped_stocks = []
+end_date = datetime.now()
+start_date = end_date - timedelta(days=90)  # fetch slightly more window for smas/indicators
+
+# Batch download attempt (faster & less likely to hit connection overhead)
+batch_data = batch_download_price_data(stocks, start_date, end_date)
 
 for stock in stocks:
     try:
-        ticker = yf.Ticker(stock)
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=60)
-        data = ticker.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+        # Get per-ticker DataFrame: from batch_data if possible, else fallback
+        data = None
+        if batch_data is not None:
+            data = get_ticker_data_from_batch(batch_data, stock)
+        if data is None or data.empty:
+            # fallback to single ticker history
+            ticker = yf.Ticker(stock)
+            data = safe_run(lambda: ticker.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d')), default=pd.DataFrame())
+            # slight delay to avoid hammering Yahoo if many fallbacks
+            time.sleep(0.05)
 
-        # ✅ Skip if not enough data (avoid ATR/RSI errors)
-        if data.empty or len(data) < 20:
-            print(f"⚠️ Skipping {stock}: insufficient data ({len(data)} rows)")
+        # Normalize column names if needed (some yfinance returns 'Adj Close' etc.)
+        if data is None or data.empty or len(data) < 20:
+            logger.warning(f"Skipping {stock}: insufficient data ({0 if data is None else len(data)} rows)")
             skipped_stocks.append(stock)
             continue
 
-        # ✅ New prediction term logic
+        # New prediction parameters
         forecast_days = 15
         days_used = len(data)
         prediction_term = "Short-Term (1-3 weeks)"
 
-        # ✅ Safe technical calculations
-        current_price = safe_run(lambda: data['Close'].iloc[-1])
-        recent_high = safe_run(lambda: data['High'].max())
-        recent_low = safe_run(lambda: data['Low'].min())
+        # Safe technical calculations
+        current_price = safe_run(lambda: data['Close'].iloc[-1], default=None, name=f"{stock}-current_price")
+        recent_high = safe_run(lambda: data['High'].max(), default=None, name=f"{stock}-recent_high")
+        recent_low = safe_run(lambda: data['Low'].min(), default=None, name=f"{stock}-recent_low")
 
-        ma5 = safe_run(lambda: data['Close'].rolling(5).mean().iloc[-1])
-        ma10 = safe_run(lambda: data['Close'].rolling(10).mean().iloc[-1])
-        ma20 = safe_run(lambda: data['Close'].rolling(20).mean().iloc[-1])
+        ma5 = safe_run(lambda: data['Close'].rolling(5).mean().iloc[-1], default=None, name=f"{stock}-ma5")
+        ma10 = safe_run(lambda: data['Close'].rolling(10).mean().iloc[-1], default=None, name=f"{stock}-ma10")
+        ma20 = safe_run(lambda: data['Close'].rolling(20).mean().iloc[-1], default=None, name=f"{stock}-ma20")
 
-        rsi = safe_run(lambda: calculate_rsi(data))
-        macd_trend = safe_run(lambda: calculate_macd_trend(data), "N/A")
-        bb_position, bb_percent = safe_run(lambda: calculate_bollinger_position(data), ("N/A", 50))
-        atr = safe_run(lambda: calculate_atr(data))
-        chart_pattern = safe_run(lambda: identify_chart_pattern(data))
-        vol_spike = safe_run(lambda: volume_spike(data))
-        liquidity = safe_run(lambda: liquidity_level(data))
+        rsi = calculate_rsi(data)
+        macd_trend = calculate_macd_trend(data)
+        bb_position, bb_percent = calculate_bollinger_position(data)
+        atr = calculate_atr(data)
+        chart_pattern = identify_chart_pattern(data)
+        vol_spike = volume_spike(data)
+        liquidity = liquidity_level(data)
 
-        # ✅ Probability, signal, and scoring
-        prob_breakout = safe_run(lambda: probability_breakout(rsi, macd_trend, bb_position))
-        signal = safe_run(lambda: trade_signal(macd_trend, rsi, bb_percent), "Neutral")
+        # Probability, signal, scoring
+        prob_breakout = probability_breakout(rsi, macd_trend, bb_position)
+        signal = trade_signal(macd_trend, rsi, bb_percent)
 
-        # ✅ Sector and sentiment
-        sector = safe_run(lambda: get_sector_trend_dynamic(stock), "Unknown")
-        earnings_str = safe_run(lambda: get_upcoming_earnings(stock), "N/A")
-        headlines = safe_run(lambda: get_recent_news(stock.split(".")[0]), [])
-        sentiment = safe_run(lambda: analyze_sentiment(headlines), "Neutral")
+        # Sector & news
+        sector = safe_run(lambda: get_sector_trend_dynamic(stock), default="Unknown", name=f"{stock}-sector")
+        earnings_str = safe_run(lambda: get_upcoming_earnings(stock), default="N/A", name=f"{stock}-earnings")
+        # Query company name by stripping suffix, but ideally use a mapping
+        company_query = stock.split(".")[0]
+        headlines = safe_run(lambda: get_recent_news(company_query), default=[], name=f"{stock}-news")
+        sentiment = safe_run(lambda: analyze_sentiment(headlines), default="Neutral", name=f"{stock}-sentiment")
         catalyst_events = "; ".join(headlines) if headlines else "No recent events"
 
-        # ✅ Technical score calculation
+        # Technical score calculation (weights as before)
         tech_score = 0
-        if macd_trend == "Bullish": tech_score += 3
-        if 30 < (rsi or 0) < 70: tech_score += 2
-        if bb_position == "Within Bands": tech_score += 1
-        if vol_spike == "Spike": tech_score += 2
-        if liquidity == "High": tech_score += 2
-        if sentiment == "Positive": tech_score += 1
+        if macd_trend == "Bullish":
+            tech_score += 3
+        if rsi is not None and 30 < rsi < 70:
+            tech_score += 2
+        if bb_position == "Within Bands":
+            tech_score += 1
+        if vol_spike == "Spike":
+            tech_score += 2
+        if liquidity == "High":
+            tech_score += 2
+        if sentiment == "Positive":
+            tech_score += 1
         tech_score_percent = round((tech_score / 11) * 100, 2)
 
-        # ✅ Price levels
-        support = recent_low
-        resistance = recent_high
-        entry_price = support + (resistance - support) * 0.2
-        target_price = resistance
-        stop_loss = support * 0.98
-        risk_reward = safe_run(lambda: round((target_price - entry_price) / (entry_price - stop_loss), 2), 0)
+        # Price levels (safe math with None checks)
+        support = recent_low if recent_low is not None else 0.0
+        resistance = recent_high if recent_high is not None else 0.0
+        entry_price = support + (resistance - support) * 0.2 if (resistance is not None and support is not None) else None
+        target_price = resistance if resistance is not None else None
+        stop_loss = support * 0.98 if support is not None else None
+        risk_reward = safe_run(lambda: round((target_price - entry_price) / (entry_price - stop_loss), 2) if None not in (target_price, entry_price, stop_loss) and (entry_price - stop_loss) != 0 else 0, default=0, name=f"{stock}-rr")
 
-        # ✅ Build DataFrame row
+        # Build DataFrame row safely
         new_row = pd.DataFrame([{
             "Stock Name": stock,
             "Date": end_date.strftime("%Y-%m-%d"),
-             "Prediction Term": prediction_term,
+            "Prediction Term": prediction_term,
             "Forecast Horizon (Days)": forecast_days,
             "Days of Data Used": days_used,
-            "Current Price": round(current_price, 2) if current_price else None,
+            "Current Price": round(current_price, 2) if current_price is not None and not pd.isna(current_price) else None,
             "Sector / Industry Outlook": sector,
             "Trend": macd_trend,
             "Recent High/Low": f"{recent_high}/{recent_low}",
-            "Current Price vs Moving Averages": f"{current_price} vs MA5:{ma5:.2f}, MA10:{ma10:.2f}, MA20:{ma20:.2f}",
+            "Current Price vs Moving Averages": f"{current_price} vs MA5:{fmt_ma(ma5)}, MA10:{fmt_ma(ma10)}, MA20:{fmt_ma(ma20)}",
             "RSI": rsi,
             "MACD Trend": macd_trend,
-            "Average Daily Volume": data['Volume'].mean(),
+            "Average Daily Volume": safe_run(lambda: float(data['Volume'].mean()), default=None, name=f"{stock}-avgvol"),
             "Recent Volume Spikes": vol_spike,
             "Liquidity": liquidity,
             "ATR": atr,
             "Expected Price Range": f"{recent_low} - {recent_high}",
-            "Volatility Level": "High" if atr > (recent_high-recent_low)/2 else "Moderate",
+            "Volatility Level": "High" if (atr is not None and recent_high is not None and recent_low is not None and atr > (recent_high-recent_low)/2) else "Moderate",
             "Key Support Levels": support,
             "Key Resistance Levels": resistance,
             "Probability of Trade Success (%)": prob_breakout,
-            "Moving Averages": f"MA5:{ma5:.2f}, MA10:{ma10:.2f}, MA20:{ma20:.2f}",
+            "Moving Averages": f"MA5:{fmt_ma(ma5)}, MA10:{fmt_ma(ma10)}, MA20:{fmt_ma(ma20)}",
             "RSI Value": rsi,
             "MACD Signal": macd_trend,
             "Bollinger Band Position": bb_position,
@@ -389,85 +583,50 @@ for stock in stocks:
             "Upcoming Earnings/Dividends/Corporate Actions": earnings_str,
             "Catalyst Events": catalyst_events,
             "Market Sentiment / Analyst Notes": sentiment,
-            "Best-case Price Target": round(target_price, 2),
-            "Likely Price Range": f"{entry_price} - {target_price}",
-            "Worst-case / Stop-Loss Risk": round(stop_loss, 2),
+            "Best-case Price Target": round(target_price, 2) if target_price is not None else None,
+            "Likely Price Range": f"{entry_price} - {target_price}" if entry_price is not None and target_price is not None else None,
+            "Worst-case / Stop-Loss Risk": round(stop_loss, 2) if stop_loss is not None else None,
             "Risk/Reward Ratio": risk_reward,
             "Technical Strength Score (%)": tech_score_percent,
-            "Suggested Entry Price Range": round(entry_price, 2),
-            "Stop-Loss Price": round(stop_loss, 2),
-            "Target Price": round(target_price, 2),
+            "Suggested Entry Price Range": round(entry_price, 2) if entry_price is not None else None,
+            "Stop-Loss Price": round(stop_loss, 2) if stop_loss is not None else None,
+            "Target Price": round(target_price, 2) if target_price is not None else None,
             "Expected Holding Duration": "1-3 weeks",
             "Additional Notes": ""
         }])
 
+        # Append to main df
         df = pd.concat([df, new_row], ignore_index=True)
 
-        # ✅ DB insert (same as before)
+        # DB insert (row0 Series)
         insert_prediction(new_row.iloc[0])
 
     except Exception as e:
-        print(f"❌ Error analyzing {stock}: {e}")
-        traceback.print_exc()
+        logger.exception(f"❌ Error analyzing {stock}: {e}")
         skipped_stocks.append(stock)
         continue
-    
-# -------------------------------
-# 6️⃣ Save to Excel
-# -------------------------------
-output_file = "short_term_analysis.xlsx"
-df.to_excel(output_file, index=False)
 
 # -------------------------------
-# 7️⃣ Apply Dashboard Formatting
+# 9️⃣ Save summary to DB (no Excel)
 # -------------------------------
-wb = openpyxl.load_workbook(output_file)
-ws = wb.active
+try:
+    # Ensure numeric coercion before saving summary
+    numeric_cols = ["Probability of Trade Success (%)", "Technical Strength Score (%)", "Risk/Reward Ratio", "Bollinger % Position", "RSI"]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    analyze_and_save_to_summary(df)
+    logger.info("✅ Prediction summary saved to DB successfully.")
+except Exception as e:
+    logger.exception(f"Failed to save summary to DB: {e}")
 
-# Trade Signal coloring (Strong Buy=Green, Strong Sell=Red, Neutral=Yellow)
-trade_signal_col = 24  # Column X
-for row in range(2, ws.max_row+1):
-    cell = ws.cell(row=row, column=trade_signal_col)
-    if cell.value == "Strong Buy":
-        cell.fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-    elif cell.value == "Strong Sell":
-        cell.fill = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid")
-    elif cell.value == "Neutral":
-        cell.fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-
-# Probability of Trade Success gradient
-prob_col = 17  # Column Q
-ws.conditional_formatting.add(f"{openpyxl.utils.get_column_letter(prob_col)}2:{openpyxl.utils.get_column_letter(prob_col)}{ws.max_row}",
-    ColorScaleRule(start_type='min', start_color='FF7F7F',
-                   mid_type='percentile', mid_value=50, mid_color='FFFF99',
-                   end_type='max', end_color='90EE90'))
-
-# Technical Strength Score gradient
-tech_col = 33  # Column AG
-ws.conditional_formatting.add(f"{openpyxl.utils.get_column_letter(tech_col)}2:{openpyxl.utils.get_column_letter(tech_col)}{ws.max_row}",
-    ColorScaleRule(start_type='min', start_color='FF7F7F',
-                   mid_type='percentile', mid_value=50, mid_color='FFFF99',
-                   end_type='max', end_color='90EE90'))
-
-# Risk/Reward Ratio coloring
-rr_col = 31  # Column AF
-for row in range(2, ws.max_row+1):
-    cell = ws.cell(row=row, column=rr_col)
-    if cell.value >= 2:
-        cell.fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-    elif 1 <= cell.value < 2:
-        cell.fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-    else:
-        cell.fill = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid")
-
-wb.save(output_file)
-print(f"✅ Fully formatted dashboard Excel saved to {output_file}")
-
-analyze_and_save_to_summary(df)
-print("✅ Prediction summary saved to DB successfully.")
-
-
+# -------------------------------
+# 1️⃣0️⃣ Skipped stocks log
+# -------------------------------
 if skipped_stocks:
-    with open("skipped_stocks.log", "a") as log:
-        log.write(f"{datetime.now()} - Skipped: {', '.join(skipped_stocks)}\n")
-    print(f"⚠️ Skipped {len(skipped_stocks)} stocks. Logged in skipped_stocks.log.")
+    try:
+        with open("skipped_stocks.log", "a") as log:
+            log.write(f"{datetime.now()} - Skipped: {', '.join(skipped_stocks)}\n")
+        logger.warning(f"⚠️ Skipped {len(skipped_stocks)} stocks. Logged in skipped_stocks.log.")
+    except Exception:
+        logger.exception("Failed to write skipped_stocks.log")
