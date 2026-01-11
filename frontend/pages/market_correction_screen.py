@@ -1,67 +1,127 @@
-import streamlit as st
+# market_correction_screen.py
+import os
 import pandas as pd
-import numpy as np
-from datetime import datetime
 import yfinance as yf
+import streamlit as st
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
 
-from near_entry_screen import (
-    fetch_active_predictions,
-    fetch_price_df,
-    calc_rsi,
-    calc_macd,
-    calc_atr,
-    find_series
+# -------------------------------------------------
+# ENV / DB
+# -------------------------------------------------
+load_dotenv()
+
+engine = create_engine(
+    f"postgresql+psycopg2://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}"
+    f"@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
 )
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-def run_market_correction_screen():
-    st.set_page_config(page_title="Market Correction Selector", layout="wide")
-    st.title("📉 Market Correction — Leadership Buy Candidates")
+# -------------------------------------------------
+# HARD SAFETY: force scalar
+# -------------------------------------------------
+def safe_float(x):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (pd.Series, pd.DataFrame)):
+            x = x.iloc[-1]
+        return float(x)
+    except Exception:
+        return None
 
-    st.info("""
-    This screen identifies **high-quality stocks that corrected with the market
-    but are still structurally strong**.  
-    Use this to *prepare* buys — not chase entries.
-    """)
+# -------------------------------------------------
+# PRICE FETCH (LIVE API)
+# -------------------------------------------------
+def fetch_price_df(symbol, period="90d"):
+    try:
+        df = yf.download(
+            symbol,
+            period=period,
+            progress=False,
+            auto_adjust=True
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df.index = pd.to_datetime(df.index).normalize()
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-    # ---------------------------
-    # Sidebar — Market Inputs
-    # ---------------------------
-    st.sidebar.header("Market Context")
-    nifty_high = st.sidebar.number_input("Recent NIFTY High", value=26000, step=50)
-    nifty_current = st.sidebar.number_input("Current NIFTY Level", value=25650, step=50)
+# -------------------------------------------------
+# INDICATORS
+# -------------------------------------------------
+def calc_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-    market_drop_pct = ((nifty_current - nifty_high) / nifty_high) * 100
-    st.sidebar.metric("Market Correction (%)", f"{market_drop_pct:.2f}%")
+def calc_macd_hist(close):
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    return macd - signal
 
-    min_market_drop = st.sidebar.slider(
-        "Min market correction to activate screen (%)",
-        -5.0, -0.5, -1.5, 0.1
+def calc_atr(df, period=14):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+# -------------------------------------------------
+# DB FETCH
+# -------------------------------------------------
+def fetch_latest_predictions():
+    df = pd.read_sql("""
+        SELECT stock_symbol, entry_price, target_price,
+               stop_loss, trade_signal, probability_success
+        FROM predictions
+        ORDER BY stock_symbol, prediction_date DESC
+    """, engine)
+
+    if df.empty:
+        return df
+
+    return df.groupby("stock_symbol", as_index=False).first()
+
+# -------------------------------------------------
+# STREAMLIT SCREEN
+# -------------------------------------------------
+def run_screen():
+    st.set_page_config(page_title="Market Correction (Close + Intraday)", layout="wide")
+    st.title("📉 Market Correction — Close vs Intraday (Dynamic Lookback)")
+
+    # ---------------- Sidebar Filters ----------------
+    st.sidebar.header("Filters")
+
+    correction_window = st.sidebar.selectbox(
+        "Correction window (days)",
+        [7, 15, 30, 45, 60, 90],
+        index=2
     )
 
-    if market_drop_pct > min_market_drop:
-        st.warning("Market correction not deep enough yet. Screen is in observation mode.")
+    min_corr = st.sidebar.slider("Min correction (%)", -30.0, -5.0, -8.0)
+    max_corr = st.sidebar.slider("Max correction (%)", -30.0, -5.0, -20.0)
+    rsi_min = st.sidebar.slider("RSI min", 30, 60, 40)
+    max_atr_pct = st.sidebar.slider("Max ATR %", 3.0, 8.0, 5.5)
+    min_rr = st.sidebar.slider("Min Reward/Risk", 1.2, 3.0, 1.8)
 
-    # ---------------------------
-    # Sidebar — Stock Filters
-    # ---------------------------
-    st.sidebar.header("Stock Filters")
+    # Always fetch enough data for indicators
+    fetch_period = "120d"
 
-    min_stock_drop = st.sidebar.slider("Min stock correction (%)", -30.0, -5.0, -8.0, 0.5)
-    max_stock_drop = st.sidebar.slider("Max stock correction (%)", -30.0, -5.0, -20.0, 0.5)
-
-    rsi_min = st.sidebar.slider("RSI min (trend safety)", 30, 60, 40, 1)
-    max_atr_pct = st.sidebar.slider("Max ATR% (volatility)", 3.0, 8.0, 5.5, 0.1)
-    min_rr = st.sidebar.slider("Min Reward/Risk", 1.2, 3.0, 1.8, 0.1)
-
-    lookback = st.sidebar.selectbox("Price history", ["60d", "90d"], index=1)
-
-    # ---------------------------
-    # Load Predictions
-    # ---------------------------
-    preds = fetch_active_predictions(latest_only=True)
+    preds = fetch_latest_predictions()
     if preds.empty:
         st.warning("No predictions found.")
         return
@@ -69,91 +129,76 @@ def run_market_correction_screen():
     rows = []
 
     for r in preds.itertuples(index=False):
-        sym = r.stock_symbol
-        price_df = fetch_price_df(sym, period=lookback)
-
-        if price_df is None or price_df.empty:
+        df = fetch_price_df(r.stock_symbol, period=fetch_period)
+        if df.empty or len(df) < correction_window:
             continue
 
-        close = find_series(price_df, ['close'])
-        high = find_series(price_df, ['high'])
-        low = find_series(price_df, ['low'])
+        close = df['Close']
+        high = df['High']
 
-        if close is None or high is None:
+        last_price = safe_float(close.iloc[-1])
+
+        high_close = safe_float(close.tail(correction_window).max())
+        high_intraday = safe_float(high.tail(correction_window).max())
+
+        if None in (last_price, high_close, high_intraday):
             continue
 
-        last_price = float(close.iloc[-1])
-        high_30d = float(high.tail(30).max())
+        corr_close = ((last_price - high_close) / high_close) * 100
+        corr_intraday = ((last_price - high_intraday) / high_intraday) * 100
 
-        stock_drop_pct = ((last_price - high_30d) / high_30d) * 100
-
-        # Stock correction filter
-        if not (max_stock_drop <= stock_drop_pct <= min_stock_drop):
+        if not (max_corr <= corr_close <= min_corr):
             continue
 
-        # RSI
-        rsi = calc_rsi(close, 14).iloc[-1]
-        if rsi < rsi_min:
+        rsi_val = safe_float(calc_rsi(close).iloc[-1])
+        if rsi_val is None or rsi_val < rsi_min:
             continue
 
-        # MACD
-        _, _, hist = calc_macd(close)
-        if hist.iloc[-1] < 0:
+        macd_val = safe_float(calc_macd_hist(close).iloc[-1])
+        if macd_val is None or macd_val < 0:
             continue
 
-        # ATR%
-        atr = calc_atr(pd.DataFrame({'High': high, 'Low': low, 'Close': close}))
-        atr_pct = (atr.iloc[-1] / last_price) * 100
+        atr_val = safe_float(calc_atr(df).iloc[-1])
+        if atr_val is None:
+            continue
+
+        atr_pct = (atr_val / last_price) * 100
         if atr_pct > max_atr_pct:
             continue
 
-        # Reward / Risk
-        entry = r.entry_price
-        target = r.target_price
-        stop = r.stop_loss
-        if entry and target and stop:
-            rr = (target - entry) / (entry - stop) if (entry - stop) > 0 else None
-        else:
-            rr = None
+        if not (r.entry_price and r.target_price and r.stop_loss):
+            continue
 
-        if rr is None or rr < min_rr:
+        rr = (r.target_price - r.entry_price) / (r.entry_price - r.stop_loss)
+        if rr < min_rr:
             continue
 
         rows.append({
-            "Stock": sym,
+            "Stock": r.stock_symbol,
             "Last Price": round(last_price, 2),
-            "30D High": round(high_30d, 2),
-            "Stock Correction (%)": round(stock_drop_pct, 2),
-            "RSI": round(rsi, 2),
+            f"{correction_window}D High (Close)": round(high_close, 2),
+            f"{correction_window}D High (Intraday)": round(high_intraday, 2),
+            "Correction % (Close)": round(corr_close, 2),
+            "Correction % (Intraday)": round(corr_intraday, 2),
+            "RSI": round(rsi_val, 2),
             "ATR %": round(atr_pct, 2),
             "Reward/Risk": round(rr, 2),
-            "Trade Signal": r.trade_signal,
+            "Signal": r.trade_signal,
             "Probability": r.probability_success
         })
 
-    # ---------------------------
-    # Display
-    # ---------------------------
     if not rows:
-        st.info("No stocks qualify yet. Be patient.")
+        st.info("No stocks qualify yet.")
         return
 
-    df = pd.DataFrame(rows)
-    df = df.sort_values(
-        by=["Stock Correction (%)", "Reward/Risk"],
+    df_out = pd.DataFrame(rows).sort_values(
+        by=["Correction % (Close)", "Reward/Risk"],
         ascending=[True, False]
     )
 
-    st.markdown(f"### ✅ {len(df)} Market-Correction Buy Candidates")
-    st.dataframe(df, use_container_width=True)
+    st.markdown(f"### ✅ {len(df_out)} Candidates ({correction_window}-Day Window)")
+    st.dataframe(df_out, use_container_width=True)
 
-    st.download_button(
-        "Download CSV",
-        df.to_csv(index=False),
-        "market_correction_candidates.csv",
-        "text/csv"
-    )
-
+# -------------------------------------------------
 if __name__ == "__main__":
-    run_market_correction_screen()
-
+    run_screen()
