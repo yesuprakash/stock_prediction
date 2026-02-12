@@ -8,6 +8,12 @@ Patched stock analysis script (Excel output removed).
 """
 
 import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
+
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(BASE_DIR,  "..", ".env"))
+
 import logging
 import yfinance as yf
 import pandas as pd
@@ -26,6 +32,9 @@ from typing import Tuple, Optional
 # -------------------------------
 # Logging config
 # -------------------------------
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -33,9 +42,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------------------
-# 0️⃣ API Keys / Config
+# API Keys / Config
 # -------------------------------
-NEWSAPI_KEY = "31a4ab26b3ca4edb9edd5b5e5bc272ef" # os.getenv("NEWSAPI_KEY")   Set this in OS env if you want news
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 if not NEWSAPI_KEY:
     logger.warning("NEWSAPI_KEY not set. get_recent_news() will return no results.")
 
@@ -91,8 +100,7 @@ columns = [
     "Expected Holding Duration", "Additional Notes"
 ]
 
-df = pd.DataFrame(columns=columns)
-
+rows = []
 # -------------------------------
 # Utility helpers & safe_run
 # -------------------------------
@@ -595,7 +603,7 @@ for stock in stocks:
         }])
 
         # Append to main df
-        df = pd.concat([df, new_row], ignore_index=True)
+        rows.append(new_row.iloc[0].to_dict())
 
         # DB insert (row0 Series)
         insert_prediction(new_row.iloc[0])
@@ -604,7 +612,7 @@ for stock in stocks:
         logger.exception(f"❌ Error analyzing {stock}: {e}")
         skipped_stocks.append(stock)
         continue
-
+df = pd.DataFrame(rows, columns=columns)
 # -------------------------------
 # 9️⃣ Save summary to DB (no Excel)
 # -------------------------------
@@ -624,8 +632,12 @@ except Exception as e:
 # -------------------------------
 if skipped_stocks:
     try:
-        with open("skipped_stocks.log", "a") as log:
+        skipped_log_path = os.path.join(LOG_DIR, "skipped_stocks.log")
+
+        with open(skipped_log_path, "a") as log:
             log.write(f"{datetime.now()} - Skipped: {', '.join(skipped_stocks)}\n")
-        logger.warning(f"⚠️ Skipped {len(skipped_stocks)} stocks. Logged in skipped_stocks.log.")
+
+        logger.warning(f"⚠️ Skipped {len(skipped_stocks)} stocks. Logged in {skipped_log_path}")
+
     except Exception:
         logger.exception("Failed to write skipped_stocks.log")
